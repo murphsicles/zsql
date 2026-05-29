@@ -1,0 +1,9 @@
+[package]
+name = "@db/zsql"
+version = "1.0.0"
+description = "Lightweight embedded SQL database for Zeta"
+authors = ["The Zeta Foundation"]
+license = "MIT"
+repository = "https://github.com/murphsicles/zsql"
+keywords = ["sql", "database", "sqlite", "zeta"]
+categories = ["database"]

@@ -1,0 +1,8 @@
+// Auto-converted from /tmp/df-rusqlite-0.32.1/rusqlite-0.32.1/src/util/mod.rs
+
+mod param_cache;
+mod small_cstr;
+pub(crate) use param_cache::ParamIndexCache;
+pub(crate) use small_cstr::SmallCString;
+mod sqlite_string;
+pub(crate) use sqlite_string::{ alloc, SqliteMallocString };

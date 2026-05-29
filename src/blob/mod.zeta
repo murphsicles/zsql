@@ -1,0 +1,214 @@
+// Auto-converted from /tmp/df-rusqlite-0.32.1/rusqlite-0.32.1/src/blob/mod.rs
+
+use std::cmp::min;
+use std::io;
+use std::ptr;
+use super::ffi;
+use super::types::{ ToSql, ToSqlOutput };
+use crate::{ Connection, DatabaseName, Result };
+mod pos_io;
+/// Handle to an open BLOB. See
+/// [`rusqlite::blob`](crate::blob) documentation for in-depth discussion.
+pub struct Blob<conn> {
+ conn: &Connection,
+ blob: *mut ffi::sqlite3_blob,
+ pos: i32,
+}
+
+impl Connection {
+ pub fn blob_open(&self, db: DatabaseName<'_>, table: &str, column: &str, row_id: i64, read_only: bool) -> Result<Blob<'a>> {
+ let c = self.db.borrow_mut();
+ let mut blob = ptr::null_mut();
+ let db = db.as_cstring() ?;
+ let table = super::str_to_cstring(table) ?;
+ let column = super::str_to_cstring(column) ?;
+ let rc = unsafe { ffi::sqlite3_blob_open(c.db(), db.as_ptr(), table.as_ptr(), column.as_ptr(), row_id, ! read_only as std::os::raw::c_int, &mut blob ) };
+ c.decode_result(rc).map(| _ | Blob { conn: self, blob, pos: 0 })
+ }
+ 
+}
+
+impl Blob<'_> {
+ pub fn reopen(&mut self, row: i64) -> Result<()> {
+ let rc = unsafe { ffi::sqlite3_blob_reopen(self.blob, row) };
+ if rc != ffi::SQLITE_OK { return self.conn.decode_result(rc); }
+ self.pos = 0;
+ Ok(())
+ }
+ 
+ pub fn size(&self) -> i32 {
+ unsafe { ffi::sqlite3_blob_bytes(self.blob) }
+ }
+ 
+ pub fn len(&self) -> usize {
+ self.size().try_into().unwrap()
+ }
+ 
+ pub fn is_empty(&self) -> bool {
+ self.size() == 0
+ }
+ 
+ pub fn close(self) -> Result<()> {
+ self.close_()
+ }
+ 
+ fn close_(&mut self) -> Result<()> {
+ let rc = unsafe { ffi::sqlite3_blob_close(self.blob) };
+ self.blob = ptr::null_mut();
+ self.conn.decode_result(rc)
+ }
+ 
+}
+
+impl io::Read for Blob<'_> {
+ fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+ let max_allowed_len = (self.size() - self.pos) as usize;
+ let n = min(buf.len(), max_allowed_len) as i32;
+ if n <= 0 { return Ok(0); }
+ let rc = unsafe { ffi::sqlite3_blob_read(self.blob, buf.as_mut_ptr().cast(), n, self.pos) };
+ self.conn.decode_result(rc).map(| _ | { self.pos += n; n as usize }).map_err(| err | io::Error::new(io::ErrorKind::Other, err))
+ }
+ 
+}
+
+impl io::Write for Blob<'_> {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ let max_allowed_len = (self.size() - self.pos) as usize;
+ let n = min(buf.len(), max_allowed_len) as i32;
+ if n <= 0 { return Ok(0); }
+ let rc = unsafe { ffi::sqlite3_blob_write(self.blob, buf.as_ptr() as * mut _, n, self.pos) };
+ self.conn.decode_result(rc).map(| _ | { self.pos += n; n as usize }).map_err(| err | io::Error::new(io::ErrorKind::Other, err))
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ Ok(())
+ }
+ 
+}
+
+impl io::Seek for Blob<'_> {
+ fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+ let pos = match pos { io::SeekFrom::Start(offset) => offset as i64, io::SeekFrom::Current(offset) => i64::from(self.pos) + offset, io::SeekFrom::End(offset) => i64::from(self.size()) + offset };
+ if pos<0 { Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid seek to negative position" )) } else if pos> i64::from(self.size()) { Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid seek to position past end of blob" )) } else { self.pos = pos as i32; Ok(pos as u64) }
+ }
+ 
+}
+
+impl Drop for Blob<'_> {
+ fn drop(&mut self) {
+ self.close_();
+ }
+ 
+}
+
+/// BLOB of length N that is filled with zeroes.
+/// 
+/// Zeroblobs are intended to serve as placeholders for BLOBs whose content is
+/// later written using incremental BLOB I/O routines.
+/// 
+/// A negative value for the zeroblob results in a zero-length BLOB.
+#[derive(Copy, Clone)]
+pub struct ZeroBlob {
+ (i32),
+}
+
+impl ToSql for ZeroBlob {
+ fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+ let _ = *self;
+ Ok(ToSqlOutput::ZeroBlob(length))
+ }
+ 
+}
+
+#[cfg(test)]
+mod test {
+ use crate::{ Connection, DatabaseName, Result };
+ use std::io::{ BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write };
+ fn db_with_test_blob() -> Result<(Connection, i64)> {
+ let db = Connection::open_in_memory() ?;
+ let sql = "BEGIN;
+ CREATE TABLE test(content BLOB);
+ INSERT INTO test VALUES(ZEROBLOB(10));
+ END;";
+ db.execute_batch(sql) ?;
+ let rowid = db.last_insert_rowid();
+ Ok((db, rowid))
+ }
+ 
+ #[test]
+ fn test_blob() -> Result<()> {
+ let _ = db_with_test_blob() ?;
+ let mut blob = db.blob_open(DatabaseName::Main, "test", "content", rowid, false) ?;
+ assert!(! blob.is_empty());
+ assert_eq!(10, blob.len());
+ assert_eq!(4, blob.write(b"Clob").unwrap());
+ assert_eq!(6, blob.write(b"567890xxxxxx").unwrap());
+ assert_eq!(0, blob.write(b"5678").unwrap());
+ blob.flush().unwrap();
+ blob.reopen(rowid) ?;
+ blob.close() ?;
+ blob = db.blob_open(DatabaseName::Main, "test", "content", rowid, true) ?;
+ let mut bytes = [0u8; 5];
+ assert_eq!(5, blob.read(&mut bytes [..]).unwrap());
+ assert_eq!(&bytes, b"Clob5");
+ assert_eq!(5, blob.read(&mut bytes [..]).unwrap());
+ assert_eq!(&bytes, b"67890");
+ assert_eq!(0, blob.read(&mut bytes [..]).unwrap());
+ blob.seek(SeekFrom::Start(2)).unwrap();
+ assert_eq!(5, blob.read(&mut bytes [..]).unwrap());
+ assert_eq!(&bytes, b"ob567");
+ blob.seek(SeekFrom::Current(- 1)).unwrap();
+ assert_eq!(4, blob.read(&mut bytes [..]).unwrap());
+ assert_eq!(&bytes, b"78907");
+ blob.seek(SeekFrom::End(- 6)).unwrap();
+ assert_eq!(5, blob.read(&mut bytes [..]).unwrap());
+ assert_eq!(&bytes, b"56789");
+ blob.reopen(rowid) ?;
+ assert_eq!(5, blob.read(&mut bytes [..]).unwrap());
+ assert_eq!(&bytes, b"Clob5");
+ blob.seek(SeekFrom::Current(- 20)).unwrap_err();
+ blob.seek(SeekFrom::End(0)).unwrap();
+ blob.seek(SeekFrom::Current(1)).unwrap_err();
+ blob.reopen(rowid) ?;
+ blob.write_all(b"0123456789x").unwrap_err();
+ Ok(())
+ }
+ 
+ #[test]
+ fn test_blob_in_bufreader() -> Result<()> {
+ let _ = db_with_test_blob() ?;
+ let mut blob = db.blob_open(DatabaseName::Main, "test", "content", rowid, false) ?;
+ assert_eq!(8, blob.write(b"one\ntwo\n").unwrap());
+ blob.reopen(rowid) ?;
+ let mut reader = BufReader::new(blob);
+ let mut line = String::new();
+ assert_eq!(4, reader.read_line(&mut line).unwrap());
+ assert_eq!("one\n", line);
+ line.truncate(0);
+ assert_eq!(4, reader.read_line(&mut line).unwrap());
+ assert_eq!("two\n", line);
+ line.truncate(0);
+ assert_eq!(2, reader.read_line(&mut line).unwrap());
+ assert_eq!("\0\0", line);
+ Ok(())
+ }
+ 
+ #[test]
+ fn test_blob_in_bufwriter() -> Result<()> {
+ let _ = db_with_test_blob() ?;
+ { let blob = db.blob_open(DatabaseName::Main, "test", "content", rowid, false) ?; let mut writer = BufWriter::new(blob); assert_eq!(8, writer.write(b"01234567").unwrap()); assert_eq!(8, writer.write(b"01234567").unwrap()); writer.flush().unwrap_err(); }
+ { let mut blob = db.blob_open(DatabaseName::Main, "test", "content", rowid, false) ?; let mut bytes = [0u8; 10]; assert_eq!(10, blob.read(&mut bytes [..]).unwrap()); assert_eq!(b"0123456701", &bytes); }
+ { let blob = db.blob_open(DatabaseName::Main, "test", "content", rowid, false) ?; let mut writer = BufWriter::new(blob); writer.write_all(b"aaaaaaaaaabbbbb").unwrap(); writer.flush().unwrap_err(); }
+ { let mut blob = db.blob_open(DatabaseName::Main, "test", "content", rowid, false) ?; let mut bytes = [0u8; 10]; assert_eq!(10, blob.read(&mut bytes [..]).unwrap()); assert_eq!(b"aaaaaaaaaa", &bytes); Ok(()) }
+ }
+ 
+ #[test]
+ fn zero_blob() -> Result<()> {
+ use crate::types::ToSql;
+ let zb = super::ZeroBlob(1);
+ assert!(zb.to_sql().is_ok());
+ Ok(())
+ }
+ 
+}
+

@@ -1,0 +1,103 @@
+// Auto-converted from /tmp/df-rusqlite-0.32.1/rusqlite-0.32.1/src/types/serde_json.rs
+
+use serde_json::{ Number, Value };
+use crate::types::{ FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef };
+use crate::{ Error, Result };
+/// Serialize JSON `Value` to text:
+/// 
+/// 
+/// | JSON | SQLite |
+/// |----------|---------|
+/// | Null | NULL |
+/// | Bool | 'true' / 'false' |
+/// | Number | INT or REAL except u64 |
+/// | _ | TEXT |
+impl ToSql for Value {
+ fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+ match self { Value::Null => Ok(ToSqlOutput::Borrowed(ValueRef::Null)), Value::Number(n) if n.is_i64() => Ok(ToSqlOutput::from(n.as_i64().unwrap())), Value::Number(n) if n.is_f64() => Ok(ToSqlOutput::from(n.as_f64().unwrap())), _ => serde_json::to_string(self).map(ToSqlOutput::from).map_err(| err | Error::ToSqlConversionFailure(err.into())) }
+ }
+ 
+}
+
+/// Deserialize SQLite value to JSON `Value`:
+/// 
+/// | SQLite | JSON |
+/// |----------|---------|
+/// | NULL | Null |
+/// | 'null' | Null |
+/// | 'true' | Bool |
+/// | 1 | Number |
+/// | 0.1 | Number |
+/// | '"text"' | String |
+/// | 'text' | _Error_ |
+/// | '[0, 1]' | Array |
+/// | '{"x": 1}' | Object |
+impl FromSql for Value {
+ fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+ match value { ValueRef::Text(s) => serde_json::from_slice(s), ValueRef::Blob(b) => serde_json::from_slice(b), ValueRef::Integer(i) => Ok(Value::Number(Number::from(i))), ValueRef::Real(f) => { match Number::from_f64(f) { Some(n) => Ok(Value::Number(n)), _ => return Err(FromSqlError::InvalidType) } } ValueRef::Null => Ok(Value::Null) } . map_err(| err | FromSqlError::Other(Box::new(err)))
+ }
+ 
+}
+
+#[cfg(test)]
+mod test {
+ use crate::types::ToSql;
+ use crate::{ Connection, Result };
+ use serde_json::{ Number, Value };
+ fn checked_memory_handle() -> Result<Connection> {
+ let db = Connection::open_in_memory() ?;
+ db.execute_batch("CREATE TABLE foo(t TEXT, b BLOB)") ?;
+ Ok(db)
+ }
+ 
+ #[test]
+ fn test_json_value() -> Result<()> {
+ let db = checked_memory_handle() ?;
+ let json = r#"{"foo": 13, "bar": "baz"}"#;
+ let _ = serde_json::from_str(json).unwrap();
+ db.execute("INSERT INTO foo(t, b) VALUES(?1, ?2)", [&data as &dyn ToSql, &json.as_bytes()] ) ?;
+ let _ = db.one_column("SELECT t FROM foo") ?;
+ assert_eq!(data, t);
+ let _ = db.one_column("SELECT b FROM foo") ?;
+ assert_eq!(data, b);
+ Ok(())
+ }
+ 
+ #[test]
+ fn test_to_sql() -> Result<()> {
+ let db = Connection::open_in_memory() ?;
+ let _ = db.query_row("SELECT ?", [Value::Null], | r | r.get(0)) ?;
+ assert_eq!(None, v);
+ let _ = db.query_row("SELECT ?", [Value::Bool(true)], | r | r.get(0)) ?;
+ assert_eq!("true", v);
+ let _ = db.query_row("SELECT ?", [Value::Number(Number::from(1))], | r | r.get(0)) ?;
+ assert_eq!(1, v);
+ let _ = db.query_row("SELECT ?", [Value::Number(Number::from_f64(0.1).unwrap())], | r | r.get(0) ) ?;
+ assert_eq!(0.1, v);
+ let _ = db.query_row("SELECT ?", [Value::String("text" . to_owned())], | r | r.get(0)) ?;
+ assert_eq!("\"text\"", v);
+ Ok(())
+ }
+ 
+ #[test]
+ fn test_from_sql() -> Result<()> {
+ let db = Connection::open_in_memory() ?;
+ let _ = db.one_column("SELECT NULL") ?;
+ assert_eq!(Value::Null, v);
+ let _ = db.one_column("SELECT 'null'") ?;
+ assert_eq!(Value::Null, v);
+ let _ = db.one_column("SELECT 'true'") ?;
+ assert_eq!(Value::Bool(true), v);
+ let _ = db.one_column("SELECT 1") ?;
+ assert_eq!(Value::Number(Number::from(1)), v);
+ let _ = db.one_column("SELECT 0.1") ?;
+ assert_eq!(Value::Number(Number::from_f64(0.1).unwrap()), v);
+ let _ = db.one_column("SELECT '\"text\"'") ?;
+ assert_eq!(Value::String("text" . to_owned()), v);
+ let _ = db.one_column("SELECT 'text'");
+ assert!(v.is_err());
+ Ok(())
+ }
+ 
+}
+
